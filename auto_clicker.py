@@ -115,25 +115,55 @@ def click_at(x, y, hold_ms=15):
     user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
 
+def _resolve_host(host, timeout=2.0):
+    """
+    带超时的 DNS 解析：Windows 上 getaddrinfo 可能长时间阻塞（实测可挂 60s），
+    放入子线程并限制等待时长，超时则跳过该服务器。
+    """
+    result = {}
+
+    def do_resolve():
+        try:
+            result["infos"] = socket.getaddrinfo(host, 123,
+                                                 socket.AF_INET, socket.SOCK_DGRAM)
+        except OSError as exc:
+            result["error"] = exc
+
+    t = threading.Thread(target=do_resolve, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return None  # 解析超时
+    if "error" in result:
+        return None
+    return result.get("infos") or None
+
+
 def ntp_time(hosts=("ntp.aliyun.com", "cn.pool.ntp.org", "ntp.tencent.com"),
-             timeout=1.2):
+             timeout=1.2, dns_timeout=2.0):
     """
     通过标准 NTP 协议获取网络时间（Unix 时间戳，秒）。
-    依次尝试多个服务器，全部失败返回 None。
+    依次尝试多个服务器（DNS 解析与网络往返均限时），全部失败返回 None。
     """
     for host in hosts:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-                sock.settimeout(timeout)
-                sock.sendto(b"\x1b" + 47 * b"\x00", (host, 123))
-                data, _ = sock.recvfrom(48)
-            if len(data) < 44:
-                continue
-            # NTP 传输时间戳位于第 40~43 字节（32 位秒），基准为 1900-01-01
-            secs = struct.unpack("!I", data[40:44])[0]
-            return secs - 2208988800
-        except OSError:
+        infos = _resolve_host(host, dns_timeout)
+        if not infos:
             continue
+        for family, socktype, proto, _canon, sockaddr in infos:
+            if socktype != socket.SOCK_DGRAM:
+                continue
+            try:
+                with socket.socket(family, socktype, proto) as sock:
+                    sock.settimeout(timeout)
+                    sock.sendto(b"\x1b" + 47 * b"\x00", sockaddr)
+                    data, _ = sock.recvfrom(48)
+                if len(data) < 44:
+                    continue
+                # NTP 传输时间戳位于第 40~43 字节（32 位秒），基准为 1900-01-01
+                secs = struct.unpack("!I", data[40:44])[0]
+                return secs - 2208988800
+            except OSError:
+                continue
     return None
 
 
@@ -178,6 +208,7 @@ class AutoClickerApp:
         self._events = queue.Queue()
         self._clicks = 0
         self._capture_pending = False
+        self._worker_thread = threading.Thread(target=lambda: None)
 
         self._build_ui()
         self._load_config()
@@ -290,25 +321,43 @@ class AutoClickerApp:
     def _poll_events(self):
         try:
             while True:
-                kind, payload = self._events.get_nowait()
-                if kind == "log":
-                    self._append_log(payload)
-                elif kind == "status":
-                    self.status_var.set(payload)
-                elif kind == "done":
-                    self._worker_finished()
+                item = self._events.get_nowait()
+                try:
+                    kind, payload = item
+                    if kind == "log":
+                        self._append_log(payload)
+                    elif kind == "status":
+                        self.status_var.set(payload)
+                    elif kind == "done":
+                        self._worker_finished()
+                except Exception as exc:
+                    # 单个事件出错不能杀死轮询，记录后继续
+                    self._append_log(f"内部错误（事件 {item!r}）: "
+                                     f"{type(exc).__name__}: {exc}")
         except queue.Empty:
+            pass
+        # 自愈：任务标记为运行中但工作线程已退出时，强制复位界面
+        try:
+            if self.running and not self._worker_thread.is_alive():
+                self._worker_finished()
+        except Exception:
             pass
         self.root.after(100, self._poll_events)
 
     def _worker_finished(self):
+        was_running = self.running
         self.running = False
-        self.start_btn.configure(state="normal")
-        self.stop_btn.configure(state="disabled")
-        if self._clicks:
-            self._log(f"本轮共点击 {self._clicks} 次")
-            self._clicks = 0
-        self.status_var.set("已停止")
+        if not was_running:
+            return  # 幂等：防止事件与自愈逻辑重复复位
+        try:
+            self.start_btn.configure(state="normal")
+            self.stop_btn.configure(state="disabled")
+            if self._clicks:
+                self._log(f"本轮共点击 {self._clicks} 次")
+                self._clicks = 0
+            self.status_var.set("已停止")
+        except Exception as exc:
+            self._append_log(f"复位界面状态失败: {type(exc).__name__}: {exc}")
 
     # ---------------- 任务操作 ----------------
 
@@ -399,11 +448,12 @@ class AutoClickerApp:
         self.stop_event.clear()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        threading.Thread(
+        self._worker_thread = threading.Thread(
             target=self._worker,
             args=(tasks, rounds, wait, bool(self.use_ntp_var.get())),
             daemon=True,
-        ).start()
+        )
+        self._worker_thread.start()
 
     def _compute_wait(self):
         """解析 HH:MM:SS，返回距该时刻的秒数（今天已过则顺延到明天）。"""
@@ -475,8 +525,12 @@ class AutoClickerApp:
                 self._log("任务已被手动停止")
             else:
                 self._log("任务完成")
+        except Exception as exc:
+            import traceback
+            self._log(f"工作线程异常: {type(exc).__name__}: {exc}")
+            self._log(traceback.format_exc())
         finally:
-            self._events.put(("done",))
+            self._events.put(("done", None))
 
     def _stop_clicking(self):
         if self.running:
