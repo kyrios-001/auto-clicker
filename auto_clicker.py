@@ -13,7 +13,9 @@ AutoClicker —— 定时定点自动点击器（Windows / 纯标准库 / 零第
 6. 全局热键：F6 开始/停止切换，F7 紧急停止；
 7. 配置自动保存 / 加载（auto_clicker_config.json，与脚本同目录）；
 8. 实时日志、运行倒计时、总点击计数；
-9. 可选窗口置顶，方便边看日志边操作。
+9. 可选窗口置顶，方便边看日志边操作；
+10. 智能条件（可选）：按屏幕像素颜色判断页面状态——点击前等页面就绪、
+    点击后等页面响应，网页反应慢时循环不再错乱（超时可选择停止或继续）。
 
 运行要求
 --------
@@ -115,6 +117,34 @@ def click_at(x, y, hold_ms=15):
     user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
 
+user32.GetDC.argtypes = [ctypes.c_void_p]
+user32.GetDC.restype = ctypes.c_void_p
+user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+user32.ReleaseDC.restype = ctypes.c_int
+
+gdi32 = ctypes.windll.gdi32
+gdi32.GetPixel.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+gdi32.GetPixel.restype = ctypes.c_uint
+
+
+def get_pixel_color(x, y):
+    """
+    读取屏幕 (x, y) 处的像素颜色，返回 (r, g, b)；失败返回 None。
+    GetDC/ReleaseDC 属 user32，GetPixel 属 gdi32，返回 COLORREF（0x00BBGGRR）；
+    目标不在有效区域内时返回 CLR_INVALID。
+    """
+    hdc = user32.GetDC(None)
+    if not hdc:
+        return None
+    try:
+        value = gdi32.GetPixel(hdc, int(x), int(y))
+    finally:
+        user32.ReleaseDC(None, hdc)
+    if value == 0xFFFFFFFF:  # CLR_INVALID
+        return None
+    return (value & 0xFF, (value >> 8) & 0xFF, (value >> 16) & 0xFF)
+
+
 def _resolve_host(host, timeout=2.0):
     """
     带超时的 DNS 解析：Windows 上 getaddrinfo 可能长时间阻塞（实测可挂 60s），
@@ -201,7 +231,7 @@ class AutoClickerApp:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_NAME)
-        self.root.minsize(640, 480)
+        self.root.minsize(760, 560)
         self.tasks = []            # [{"x","y","count","interval_ms"}, ...]
         self.running = False
         self.stop_event = threading.Event()
@@ -226,11 +256,11 @@ class AutoClickerApp:
         # 任务列表
         list_frame = ttk.LabelFrame(root, text="任务列表（坐标 / 次数 / 间隔）")
         list_frame.pack(fill="both", expand=True, **pad)
-        cols = ("id", "x", "y", "count", "interval")
+        cols = ("id", "x", "y", "count", "interval", "cond")
         self.tree = ttk.Treeview(list_frame, columns=cols, show="headings", height=8)
         heads = {"id": "编号", "x": "X 坐标", "y": "Y 坐标",
-                 "count": "次数(0=无限)", "interval": "间隔(毫秒)"}
-        widths = {"id": 60, "x": 90, "y": 90, "count": 110, "interval": 120}
+                 "count": "次数(0=无限)", "interval": "间隔(毫秒)", "cond": "智能条件"}
+        widths = {"id": 50, "x": 80, "y": 80, "count": 100, "interval": 110, "cond": 100}
         for c in cols:
             self.tree.heading(c, text=heads[c])
             self.tree.column(c, width=widths[c], anchor="center")
@@ -292,6 +322,56 @@ class AutoClickerApp:
         self.stop_btn = ttk.Button(run_frame, text="■ 停止（F7）",
                                    command=self._stop_clicking, state="disabled")
         self.stop_btn.grid(row=1, column=3, columnspan=4, sticky="ew", padx=4, pady=4)
+
+        # 智能条件：按屏幕颜色判断页面状态
+        cond_frame = ttk.LabelFrame(
+            root, text="智能条件（可选）：按屏幕像素颜色判断页面状态，网页反应慢时循环不乱")
+        cond_frame.pack(fill="x", **pad)
+
+        self.ready_enable_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(cond_frame, text="就绪等待", variable=self.ready_enable_var).grid(
+            row=0, column=0, padx=4)
+        self.ready_x_var = tk.StringVar(value="")
+        self.ready_y_var = tk.StringVar(value="")
+        self.ready_color_var = tk.StringVar(value="#FFFFFF")
+        self.ready_tol_var = tk.StringVar(value="30")
+        self.ready_timeout_var = tk.StringVar(value="30")
+        ttk.Entry(cond_frame, textvariable=self.ready_x_var, width=6).grid(row=0, column=1)
+        ttk.Entry(cond_frame, textvariable=self.ready_y_var, width=6).grid(row=0, column=2)
+        ttk.Entry(cond_frame, textvariable=self.ready_color_var, width=9).grid(row=0, column=3)
+        ttk.Button(cond_frame, text="取色", width=5,
+                   command=self._capture_ready_color).grid(row=0, column=4, padx=2)
+        ttk.Label(cond_frame, text="容差").grid(row=0, column=5)
+        ttk.Entry(cond_frame, textvariable=self.ready_tol_var, width=4).grid(row=0, column=6)
+        ttk.Label(cond_frame, text="超时s").grid(row=0, column=7)
+        ttk.Entry(cond_frame, textvariable=self.ready_timeout_var, width=4).grid(row=0, column=8)
+
+        self.done_enable_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(cond_frame, text="完成等待", variable=self.done_enable_var).grid(
+            row=1, column=0, padx=4)
+        self.done_x_var = tk.StringVar(value="")
+        self.done_y_var = tk.StringVar(value="")
+        self.done_color_var = tk.StringVar(value="#FFFFFF")
+        self.done_tol_var = tk.StringVar(value="30")
+        self.done_timeout_var = tk.StringVar(value="30")
+        ttk.Entry(cond_frame, textvariable=self.done_x_var, width=6).grid(row=1, column=1)
+        ttk.Entry(cond_frame, textvariable=self.done_y_var, width=6).grid(row=1, column=2)
+        ttk.Entry(cond_frame, textvariable=self.done_color_var, width=9).grid(row=1, column=3)
+        ttk.Button(cond_frame, text="取色", width=5,
+                   command=self._capture_done_color).grid(row=1, column=4, padx=2)
+        ttk.Label(cond_frame, text="容差").grid(row=1, column=5)
+        ttk.Entry(cond_frame, textvariable=self.done_tol_var, width=4).grid(row=1, column=6)
+        ttk.Label(cond_frame, text="超时s").grid(row=1, column=7)
+        ttk.Entry(cond_frame, textvariable=self.done_timeout_var, width=4).grid(row=1, column=8)
+
+        ttk.Label(cond_frame, text="条件超时后:").grid(row=2, column=0, columnspan=2, sticky="e")
+        self.timeout_policy_var = tk.StringVar(value="stop")
+        ttk.Radiobutton(cond_frame, text="停止", value="stop",
+                        variable=self.timeout_policy_var).grid(row=2, column=2)
+        ttk.Radiobutton(cond_frame, text="继续", value="continue",
+                        variable=self.timeout_policy_var).grid(row=2, column=3)
+        ttk.Button(cond_frame, text="应用到选中任务", command=self._apply_cond_to_selected).grid(
+            row=2, column=4, columnspan=3, padx=4, pady=2)
 
         # 状态栏 + 日志
         self.status_var = tk.StringVar(value="就绪")
@@ -375,6 +455,118 @@ class AutoClickerApp:
         self.y_var.set(str(y))
         self._log(f"已捕获鼠标位置：({x}, {y})")
 
+    # ---------------- 智能条件（颜色判断） ----------------
+
+    def _capture_ready_color(self):
+        self._capture_cond_color("ready")
+
+    def _capture_done_color(self):
+        self._capture_cond_color("done")
+
+    def _capture_cond_color(self, which):
+        if self._capture_pending:
+            return
+        self._capture_pending = True
+        self._capture_target = which
+        self._log("请在 3 秒内把鼠标移动到要取色的位置…")
+        self.root.after(3000, self._do_capture_color)
+
+    def _do_capture_color(self):
+        self._capture_pending = False
+        x, y = get_cursor_pos()
+        color = get_pixel_color(x, y)
+        if color is None:
+            self._log("取色失败（该位置可能超出屏幕有效区域）")
+            return
+        prefix = self._capture_target
+        getattr(self, f"{prefix}_x_var").set(str(x))
+        getattr(self, f"{prefix}_y_var").set(str(y))
+        hex_color = "#%02X%02X%02X" % color
+        getattr(self, f"{prefix}_color_var").set(hex_color)
+        self._log(f"已捕获颜色 {hex_color} @ ({x}, {y})")
+
+    @staticmethod
+    def _parse_color(text):
+        """解析 '#RRGGBB' 或 'r,g,b' 为 (r, g, b)；非法时抛 ValueError。"""
+        text = text.strip().lstrip("#")
+        if len(text) == 6:
+            try:
+                return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16))
+            except ValueError:
+                pass
+        parts = [p for p in text.split(",") if p != ""]
+        if len(parts) == 3:
+            r, g, b = (int(p) for p in parts)
+            if all(0 <= v <= 255 for v in (r, g, b)):
+                return (r, g, b)
+        raise ValueError("颜色格式应为 #RRGGBB 或 r,g,b")
+
+    def _make_cond(self, prefix):
+        """根据 UI 字段构造条件 dict；未勾选返回 None；字段非法抛 ValueError。"""
+        if not getattr(self, f"{prefix}_enable_var").get():
+            return None
+        x = int(getattr(self, f"{prefix}_x_var").get().strip())
+        y = int(getattr(self, f"{prefix}_y_var").get().strip())
+        color = list(self._parse_color(getattr(self, f"{prefix}_color_var").get()))
+        tol = int(getattr(self, f"{prefix}_tol_var").get().strip())
+        timeout = float(getattr(self, f"{prefix}_timeout_var").get().strip())
+        if tol < 0 or timeout <= 0:
+            raise ValueError
+        return {"x": x, "y": y, "color": color, "tol": tol, "timeout": timeout}
+
+    @staticmethod
+    def _pixel_matches(cond):
+        """判断条件点当前颜色是否在容差内匹配期望色。"""
+        color = get_pixel_color(cond["x"], cond["y"])
+        if color is None:
+            return False
+        tol = cond.get("tol", 30)
+        return all(abs(c - want) <= tol for c, want in zip(color, cond["color"]))
+
+    def _wait_condition(self, cond, label, timeout):
+        """
+        轮询等待条件满足；F7 可随时中断。
+        返回 (是否满足, 已等待秒数)。
+        """
+        t0 = time.time()
+        deadline = t0 + timeout
+        last_status = 0.0
+        while True:
+            if self.stop_event.is_set():
+                return False, time.time() - t0
+            if self._pixel_matches(cond):
+                return True, time.time() - t0
+            now = time.time()
+            if now >= deadline:
+                return False, now - t0
+            if now - last_status >= 0.5:
+                self._events.put(("status", f"等待{label}…剩余{deadline - now:.0f}s"))
+                last_status = now
+            self.stop_event.wait(0.2)
+
+    def _cond_label(self, t):
+        parts = [name for name, key in (("就绪", "ready"), ("完成", "done"))
+                 if t.get(key)]
+        return "+".join(parts) if parts else "—"
+
+    def _apply_cond_to_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先在列表中选中要修改的任务")
+            return
+        try:
+            ready = self._make_cond("ready")
+            done = self._make_cond("done")
+        except ValueError:
+            messagebox.showwarning(
+                "提示", "智能条件字段非法：颜色应为 #RRGGBB，容差/超时需为有效非负数")
+            return
+        idx = int(sel[0])
+        self.tasks[idx]["ready"] = ready
+        self.tasks[idx]["done"] = done
+        self._refresh_tree()
+        self._save_config()
+
     def _add_task(self):
         try:
             x = int(self.x_var.get().strip())
@@ -387,7 +579,15 @@ class AutoClickerApp:
         if iv < 0 or count < 0:
             messagebox.showwarning("提示", "次数与间隔不能为负数")
             return
-        self.tasks.append({"x": x, "y": y, "count": count, "interval_ms": iv})
+        try:
+            ready = self._make_cond("ready")
+            done = self._make_cond("done")
+        except ValueError:
+            messagebox.showwarning(
+                "提示", "智能条件字段非法：颜色应为 #RRGGBB，容差/超时需为有效非负数")
+            return
+        self.tasks.append({"x": x, "y": y, "count": count, "interval_ms": iv,
+                           "ready": ready, "done": done})
         self._refresh_tree()
         self._save_config()
 
@@ -416,7 +616,8 @@ class AutoClickerApp:
         self.tree.delete(*self.tree.get_children())
         for i, t in enumerate(self.tasks):
             self.tree.insert("", "end", iid=str(i),
-                             values=(i + 1, t["x"], t["y"], t["count"], t["interval_ms"]))
+                             values=(i + 1, t["x"], t["y"], t["count"],
+                                     t["interval_ms"], self._cond_label(t)))
 
     # ---------------- 运行控制 ----------------
 
@@ -450,7 +651,8 @@ class AutoClickerApp:
         self.stop_btn.configure(state="normal")
         self._worker_thread = threading.Thread(
             target=self._worker,
-            args=(tasks, rounds, wait, bool(self.use_ntp_var.get())),
+            args=(tasks, rounds, wait, bool(self.use_ntp_var.get()),
+                  self.timeout_policy_var.get()),
             daemon=True,
         )
         self._worker_thread.start()
@@ -475,7 +677,7 @@ class AutoClickerApp:
             target += 86400
         return target - time.time()
 
-    def _worker(self, tasks, rounds, wait, use_ntp):
+    def _worker(self, tasks, rounds, wait, use_ntp, timeout_policy="stop"):
         try:
             if use_ntp and wait > 0:
                 self._log("正在校准网络时间（NTP）…")
@@ -508,6 +710,22 @@ class AutoClickerApp:
                 for t in tasks:
                     if self.stop_event.is_set():
                         break
+                    # 就绪条件：页面就绪后才开始点击
+                    cond = t.get("ready")
+                    if cond:
+                        self._log(f"等待页面就绪（点 {cond['x']},{cond['y']} 变为期望色）…")
+                        ok, waited = self._wait_condition(
+                            cond, "页面就绪", cond.get("timeout", 30))
+                        if ok:
+                            self._log(f"页面就绪（等待 {waited:.1f}s），开始点击")
+                        else:
+                            self._log(f"就绪条件超时（{waited:.1f}s 未满足）")
+                            if timeout_policy == "stop":
+                                self._log("按超时策略：停止")
+                                self.stop_event.set()
+                                break
+                            self._log("按超时策略：跳过该任务")
+                            continue
                     x, y, count, iv_ms = t["x"], t["y"], t["count"], t["interval_ms"]
                     iv = max(0.0, iv_ms / 1000.0)
                     done = 0
@@ -519,6 +737,20 @@ class AutoClickerApp:
                         done += 1
                         if (count == 0 or done < count) and iv > 0:
                             self.stop_event.wait(iv)
+                    # 完成条件：点击后等待页面响应再进入下一步
+                    cond = t.get("done")
+                    if cond and not self.stop_event.is_set():
+                        ok, waited = self._wait_condition(
+                            cond, "页面响应", cond.get("timeout", 30))
+                        if ok:
+                            self._log(f"页面已响应（等待 {waited:.1f}s）")
+                        else:
+                            self._log(f"完成条件超时（{waited:.1f}s 未满足）")
+                            if timeout_policy == "stop":
+                                self._log("按超时策略：停止")
+                                self.stop_event.set()
+                                break
+                            self._log("按超时策略：继续下一个任务")
                 if rounds != 0 and round_no >= rounds:
                     break
             if self.stop_event.is_set():
@@ -572,6 +804,7 @@ class AutoClickerApp:
             "schedule": self.schedule_var.get(),
             "rounds": self.rounds_var.get(),
             "use_ntp": bool(self.use_ntp_var.get()),
+            "timeout_policy": self.timeout_policy_var.get(),
         }
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -594,11 +827,24 @@ class AutoClickerApp:
                 if not all(k in t for k in ("x", "y", "count", "interval_ms")):
                     continue
                 try:
-                    clean.append({"x": int(t["x"]), "y": int(t["y"]),
-                                  "count": int(t["count"]),
-                                  "interval_ms": int(t["interval_ms"])})
+                    task = {"x": int(t["x"]), "y": int(t["y"]),
+                            "count": int(t["count"]),
+                            "interval_ms": int(t["interval_ms"])}
                 except (TypeError, ValueError):
                     continue
+                for key in ("ready", "done"):
+                    cond = t.get(key)
+                    if isinstance(cond, dict):
+                        try:
+                            task[key] = {"x": int(cond["x"]), "y": int(cond["y"]),
+                                         "color": [int(v) for v in cond["color"]],
+                                         "tol": int(cond.get("tol", 30)),
+                                         "timeout": float(cond.get("timeout", 30))}
+                        except (KeyError, TypeError, ValueError):
+                            task[key] = None
+                    else:
+                        task[key] = None
+                clean.append(task)
             self.tasks = clean
         if data.get("mode") in ("immediate", "scheduled"):
             self.mode_var.set(data["mode"])
@@ -608,6 +854,8 @@ class AutoClickerApp:
             self.rounds_var.set(str(data["rounds"]))
         if "use_ntp" in data:
             self.use_ntp_var.set(bool(data["use_ntp"]))
+        if data.get("timeout_policy") in ("stop", "continue"):
+            self.timeout_policy_var.set(data["timeout_policy"])
 
     def _on_close(self):
         self._save_config()
@@ -625,6 +873,8 @@ def run_self_check():
     print(f"GetCursorPos OK -> ({x}, {y})")
     user32.SetCursorPos(x, y)  # 原地重置，不移动鼠标
     print("SetCursorPos OK")
+    color = get_pixel_color(x, y)
+    print(f"GetPixel OK -> {color}")
     print("mouse_event / NTP 接口已加载")
     print("自检通过")
 
