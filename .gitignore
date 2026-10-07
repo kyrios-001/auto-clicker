@@ -3,7 +3,7 @@ __pycache__/
 *.pyo
 *.spec
 auto_clicker_config.json
-_commit_msg.txt
+_commit_msg*.txt
 build/
 dist/
 .venv/
