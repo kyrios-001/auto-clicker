@@ -1,0 +1,3 @@
+# AutoClicker 零第三方依赖
+# 仅需 Python 3.8+（Windows 系统），无需 pip install 任何包。
+# 全部依赖均为 Python 标准库：tkinter、ctypes、socket、struct、json 等。
